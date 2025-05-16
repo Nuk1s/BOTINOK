@@ -27,14 +27,7 @@ class Config:
     YT_CHANNEL_ID = os.getenv("YT_CHANNEL_ID")
     STATE_FILE = os.path.join(os.path.dirname(__file__), "bot_state.json")
     CHECK_INTERVAL = 10
-    PORT = int(os.environ["PORT"])  # Обязательное использование переменной окружения
-
-    @classmethod
-    def verify_config(cls):
-        required = ["TG_TOKEN", "TG_CHANNEL", "YT_KEY", "YT_CHANNEL_ID"]
-        missing = [var for var in required if not getattr(cls, var)]
-        if missing:
-            raise ValueError(f"Отсутствуют переменные окружения: {', '.join(missing)}")
+    PORT = int(os.environ["PORT"])  # Только из переменной окружения
 
 class StateManager:
     def __init__(self):
@@ -52,6 +45,10 @@ class StateManager:
             self._state.update(new_state)
             with open(Config.STATE_FILE, 'w') as f:
                 json.dump(self._state, f, indent=2)
+    
+    @property
+    def state(self):
+        return self._state.copy()
 
 state_manager = StateManager()
 
@@ -93,12 +90,12 @@ def check_task():
             if (datetime.now(timezone.utc) - published) > timedelta(hours=24):
                 return
 
-            if not state_manager._state['initialized']:
+            if not state_manager.state['initialized']:
                 state_manager.update({'last_video_id': video_id, 'initialized': True})
                 logger.info("Инициализировано начальное состояние")
                 return
 
-            if video_id != state_manager._state['last_video_id']:
+            if video_id != state_manager.state['last_video_id']:
                 if telegram_send({'id': video_id, 'title': video['snippet']['title']}):
                     state_manager.update({'last_video_id': video_id})
                     logger.info(f"Отправлено уведомление для видео {video_id}")
@@ -112,8 +109,6 @@ def shutdown_handler(signum, frame):
     scheduler.shutdown()
 
 def create_app():
-    Config.verify_config()  # Проверка конфигурации
-    
     if os.environ.get("GUNICORN_WORKER") != "true":
         signal.signal(signal.SIGTERM, shutdown_handler)
         signal.signal(signal.SIGINT, shutdown_handler)
@@ -126,7 +121,7 @@ def create_app():
         )
         scheduler.start()
         check_task()
-        logger.info(f"Сервер запущен на порту {Config.PORT}")
+        logger.info(f"Приложение запущено на порту {Config.PORT}")
     
     return app
 
