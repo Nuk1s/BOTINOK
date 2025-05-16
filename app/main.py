@@ -31,6 +31,7 @@ class Config:
     YT_CHANNEL_ID = os.getenv("YT_CHANNEL_ID")
     STATE_FILE = "bot_state.json"
     CHECK_INTERVAL = 10  # Интервал проверки в минутах
+    MAX_VIDEO_AGE_HOURS = 24  # Максимальный возраст видео для инициализации
 
 class StateManager:
     def __init__(self):
@@ -139,6 +140,7 @@ def check_video_task():
 
         response = YouTubeService.get_latest_video()
         if not response or not response.get('items'):
+            logger.warning("No videos found in response")
             return
 
         try:
@@ -148,41 +150,45 @@ def check_video_task():
             published_str = video['snippet']['publishedAt'].replace('Z', '')
             published_at = datetime.fromisoformat(published_str).replace(tzinfo=timezone.utc)
         except KeyError as e:
-            logger.error(f"Invalid YouTube response: {e}")
+            logger.error(f"Invalid YouTube response structure: {e}")
             return
 
         current_time = datetime.now(timezone.utc)
         time_diff = current_time - published_at
+        max_age = timedelta(hours=Config.MAX_VIDEO_AGE_HOURS)
         
-        # Проверка возраста видео (максимум 2 интервала проверки)
-        max_age = timedelta(minutes=Config.CHECK_INTERVAL * 2)
         if time_diff > max_age:
             logger.warning(f"Skipping old video ({time_diff} old)")
             return
 
         current_state = state_manager.state
         
-        # Инициализация состояния при первом запуске
+        # Инициализация только с актуальными видео
         if not current_state['initialized']:
-            logger.info("Initializing state")
-            state_manager.update_and_save({
-                'last_video_id': current_id,
-                'initialized': True
-            })
-            current_state = state_manager.state  # Обновляем локальное состояние
+            if time_diff <= max_age:
+                logger.info("Initializing state with current video")
+                state_manager.update_and_save({
+                    'last_video_id': current_id,
+                    'initialized': True
+                })
+                current_state = state_manager.state
+            else:
+                logger.warning("Skipping initialization: video too old")
             return
 
-        # Основная логика проверки
-        if current_id != current_state['last_video_id'] and current_id != state_manager.last_sent:
+        # Основная логика проверки новых видео
+        if (current_id != current_state['last_video_id'] 
+            and current_id != state_manager.last_sent):
+            
             logger.info(f"New video detected: {current_id}")
             if TelegramService.send_alert({'id': current_id, 'title': title}):
                 state_manager.last_sent = current_id
                 state_manager.update_and_save({'last_video_id': current_id})
                 logger.info("State updated successfully")
             else:
-                logger.error("Notification failed")
+                logger.error("Notification sending failed")
         else:
-            logger.info("No new videos")
+            logger.info("No new videos detected")
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(
