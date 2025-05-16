@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: youtube-monitor
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app.main:app --bind 0.0.0.0:$PORT
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: YT_KEY
+        value: AIzaSyDR_iQo0qOpZ6jIEnZQZfija-QXVAMEogc  # Замените на реальный ключ YouTube API
+      - key: TG_TOKEN
+        value: 8044378203:AAFNVsZlYbiF5W0SX10uxr5W3ZT-WYKpebs  # Замените на токен бота Telegram
+      - key: TG_CHANNEL
+        value: @pmchat123  # Замените на @username канала
+      - key: YT_CHANNEL_ID
+        value: UCW8eE7SOnIdRUmidxB--nOg  # ID канала NUKES (можно оставить)
