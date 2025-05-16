@@ -26,9 +26,9 @@ class Config:
     YT_KEY = os.getenv("YT_KEY")
     YT_CHANNEL_ID = os.getenv("YT_CHANNEL_ID")
     STATE_FILE = "bot_state.json"
-    CHECK_INTERVAL = 10
+    CHECK_INTERVAL = 10  # минут
     MAX_VIDEO_AGE = timedelta(hours=24)
-    PORT = int(os.getenv("PORT", 5000))
+    PORT = int(os.environ.get("PORT", 5000))  # Используем os.environ.get
 
 class StateManager:
     def __init__(self):
@@ -49,11 +49,12 @@ class StateManager:
             self._state.update(new_state)
             try:
                 with open(Config.STATE_FILE, 'w') as f:
-                    json.dump(self._state, f, indent=2)
+                    json.dump(self._state, f, indent=2, ensure_ascii=False)
+                    os.fsync(f.fileno())  # Принудительная запись на диск
             except Exception as e:
                 logger.error(f"Ошибка сохранения: {str(e)}")
     
-    @property  # Добавлен декоратор свойства
+    @property
     def state(self):
         return self._state.copy()
 
@@ -75,14 +76,19 @@ def youtube_fetch():
         )
         return req.execute()
     except Exception as e:
-        logger.error(f"Ошибка YouTube: {str(e)}")
+        logger.error(f"Ошибка YouTube API: {str(e)}")
         return None
 
 def telegram_send(video_data):
     if not all([Config.TG_TOKEN, Config.TG_CHANNEL]):
+        logger.warning("Пропущены учетные данные Telegram")
         return False
     
-    message = f"🎥 Новое видео!\n<b>{video_data['title']}</b>\nhttps://youtu.be/{video_data['id']}"
+    message = (
+        f"🎥 Новое видео!\n\n"
+        f"<b>{video_data['title']}</b>\n\n"
+        f"Ссылка: https://youtu.be/{video_data['id']}"
+    )
     
     try:
         response = requests.post(
@@ -92,7 +98,7 @@ def telegram_send(video_data):
                 'text': message,
                 'parse_mode': 'HTML'
             },
-            timeout=10
+            timeout=15
         )
         return response.status_code == 200
     except Exception as e:
@@ -108,33 +114,41 @@ def check_task():
 
             video = data['items'][0]
             video_id = video['id']['videoId']
-            published = datetime.fromisoformat(
-                video['snippet']['publishedAt'].replace('Z', '') + '+00:00'
+            title = video['snippet']['title']
+            published_at = datetime.fromisoformat(
+                video['snippet']['publishedAt'].rstrip('Z') + '+00:00'
             )
 
-            if (datetime.now(timezone.utc) - published) > Config.MAX_VIDEO_AGE:
+            if (datetime.now(timezone.utc) - published_at) > Config.MAX_VIDEO_AGE:
                 return
 
-            current_state = state_manager.state  # Теперь доступ через свойство
+            current_state = state_manager.state
 
             if not current_state['initialized']:
-                state_manager.update({'last_video_id': video_id, 'initialized': True})
+                state_manager.update({
+                    'last_video_id': video_id,
+                    'initialized': True
+                })
+                logger.info("Инициализировано начальное состояние")
                 return
 
             if video_id != current_state['last_video_id']:
-                if telegram_send({'id': video_id, 'title': video['snippet']['title']}):
+                if telegram_send({'id': video_id, 'title': title}):
                     state_manager.update({'last_video_id': video_id})
+                    logger.info(f"Отправлено уведомление для видео: {video_id}")
 
         except Exception as e:
-            logger.error(f"Ошибка проверки: {str(e)}")
+            logger.error(f"Ошибка в задаче проверки: {str(e)}", exc_info=True)
 
 scheduler = BackgroundScheduler()
 
 def shutdown_handler(signum, frame):
     logger.info("Завершение работы...")
     scheduler.shutdown()
+    logger.info("Планировщик остановлен")
 
 def create_app():
+    # Инициализация только в основном процессе
     if not os.environ.get("GUNICORN_WORKER"):
         signal.signal(signal.SIGTERM, shutdown_handler)
         signal.signal(signal.SIGINT, shutdown_handler)
@@ -143,16 +157,17 @@ def create_app():
             check_task,
             'interval',
             minutes=Config.CHECK_INTERVAL,
-            max_instances=1
+            max_instances=1,
+            misfire_grace_time=300
         )
         
         try:
             if not scheduler.running:
                 scheduler.start()
-                logger.info(f"Сервер запущен на порту: {Config.PORT}")
-                check_task()
+                logger.info(f"Сервер запущен на порту {Config.PORT}")
+                check_task()  # Первоначальный запуск
         except Exception as e:
-            logger.error(f"Ошибка запуска: {str(e)}")
+            logger.error(f"Ошибка запуска планировщика: {str(e)}")
 
     return app
 
