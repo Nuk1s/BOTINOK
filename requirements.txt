@@ -1,6 +1,7 @@
 flask==2.3.2
-requests==2.32.2
-google-api-python-client==2.108.0
 apscheduler==3.10.1
+google-api-python-client==2.108.0
+requests==2.32.2
 gunicorn==21.2.0
 python-dotenv==1.0.0
+protobuf==6.31.0
