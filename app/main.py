@@ -1,3 +1,4 @@
+# app/main.py
 import os
 import json
 import signal
@@ -24,10 +25,10 @@ app = Flask(__name__)
 lock = threading.Lock()
 
 class Config:
-    TG_TOKEN = os.getenv("TG_TOKEN", "8044378203:AAFNVsZlYbiF5W0SX10uxr5W3ZT-WYKpebs")
-    TG_CHANNEL = os.getenv("TG_CHANNEL", "@pmchat123")
-    YT_KEY = os.getenv("YT_KEY", "AIzaSyBYNDz9yuLS7To77AXFLcWpVf54j2GK8c8")
-    YT_CHANNEL_ID = os.getenv("YT_CHANNEL_ID", "UCW8eE7SOnIdRUmidxB--nOg")
+    TG_TOKEN = os.getenv("TG_TOKEN")
+    TG_CHANNEL = os.getenv("TG_CHANNEL")
+    YT_KEY = os.getenv("YT_KEY")
+    YT_CHANNEL_ID = os.getenv("YT_CHANNEL_ID")
     STATE_FILE = "bot_state.json"
     CHECK_INTERVAL = 10  # Интервал проверки в минутах
 
@@ -38,14 +39,28 @@ class StateManager:
     def _load_state(self):
         try:
             with open(Config.STATE_FILE, 'r') as f:
-                return json.load(f)
+                data = json.load(f)
+                logger.info(f"Loaded state: {data}")
+                return data
+        except FileNotFoundError:
+            logger.warning("State file not found. Creating new one.")
+            self._create_default_state()
+            return {'last_video_id': None, 'initialized': False}
         except Exception as e:
-            logger.warning(f"State init: {str(e)}")
+            logger.error(f"State load error: {str(e)}")
             return {'last_video_id': None, 'initialized': False}
 
-    def save_state(self):
+    def _create_default_state(self):
         with open(Config.STATE_FILE, 'w') as f:
-            json.dump(self.state, f)
+            json.dump({'last_video_id': None, 'initialized': False}, f)
+
+    def save_state(self):
+        try:
+            with open(Config.STATE_FILE, 'w') as f:
+                json.dump(self.state, f)
+            logger.info("State saved successfully")
+        except Exception as e:
+            logger.error(f"State save failed: {str(e)}")
 
 state_manager = StateManager()
 
@@ -65,15 +80,29 @@ class YouTubeService:
                 order="date",
                 type="video"
             )
-            return request.execute()
+            response = request.execute()
+            logger.debug("YouTube API response: %s", response)
+            return response
         except HttpError as e:
-            logger.error(f"YouTube API error: {e}")
+            logger.error(f"YouTube API Error: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"YouTube Service Error: {e}")
             return None
 
 class TelegramService:
     @staticmethod
     def send_alert(video_data):
-        message = f"🎥 Новое видео!\n\n<b>{video_data['title']}</b>\n\nСсылка: https://youtu.be/{video_data['id']}"
+        if not all([Config.TG_TOKEN, Config.TG_CHANNEL]):
+            logger.error("Telegram credentials not configured!")
+            return False
+            
+        message = (
+            f"🎥 Новое видео!\n\n"
+            f"<b>{video_data['title']}</b>\n\n"
+            f"Ссылка: https://youtu.be/{video_data['id']}"
+        )
+        
         try:
             response = requests.post(
                 f"https://api.telegram.org/bot{Config.TG_TOKEN}/sendMessage",
@@ -82,55 +111,101 @@ class TelegramService:
                     'text': message,
                     'parse_mode': 'HTML'
                 },
-                timeout=10
+                timeout=15
             )
-            return response.raise_for_status()
+            response.raise_for_status()
+            logger.info("Message sent to Telegram successfully")
+            return True
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Telegram API Error: {str(e)}")
+            if response:
+                logger.error(f"Response content: {response.text}")
+            return False
         except Exception as e:
-            logger.error(f"Telegram error: {e}")
+            logger.error(f"Telegram Service Error: {str(e)}")
             return False
 
 def check_video_task():
     with lock:
+        logger.info("===== Starting video check =====")
+        
+        # Получаем данные с YouTube
         response = YouTubeService.get_latest_video()
-        if not response or not response.get('items'):
+        if not response:
+            logger.error("Failed to get YouTube data")
             return
 
-        video = response['items'][0]
-        current_id = video['id']['videoId']
+        items = response.get('items')
+        if not items:
+            logger.warning("No videos found in response")
+            return
+
+        try:
+            video = items[0]
+            current_id = video['id']['videoId']
+            title = video['snippet']['title']
+            logger.info(f"Latest video: {current_id} - {title}")
+        except KeyError as e:
+            logger.error(f"Invalid YouTube response structure: {str(e)}")
+            return
+
+        # Обработка состояния
         state = state_manager.state
+        logger.debug(f"Current state: {state}")
 
         if not state['initialized']:
-            state.update(last_video_id=current_id, initialized=True)
+            logger.info("Initializing state with first video")
+            state['last_video_id'] = current_id
+            state['initialized'] = True
             state_manager.save_state()
             return
 
         if current_id != state['last_video_id']:
-            video_data = {
-                'id': current_id,
-                'title': video['snippet']['title']
-            }
+            logger.info("New video detected! Sending notification...")
+            video_data = {'id': current_id, 'title': title}
+            
             if TelegramService.send_alert(video_data):
                 state['last_video_id'] = current_id
                 state_manager.save_state()
+                logger.info("State updated successfully")
+            else:
+                logger.error("Failed to send notification")
+        else:
+            logger.info("No new videos found")
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(
     check_video_task,
     'interval',
     minutes=Config.CHECK_INTERVAL,
-    max_instances=1
+    max_instances=1,
+    coalesce=True,
+    misfire_grace_time=300
 )
 
 def graceful_shutdown(signum, frame):
-    logger.info("Shutting down...")
+    logger.info("Shutting down scheduler...")
     scheduler.shutdown()
+    logger.info("Saving final state...")
     state_manager.save_state()
+    logger.info("Shutdown complete")
 
 def create_app():
+    # Регистрация обработчиков сигналов
     signal.signal(signal.SIGTERM, graceful_shutdown)
     signal.signal(signal.SIGINT, graceful_shutdown)
-    scheduler.start()
-    check_video_task()
+    
+    # Запуск планировщика
+    if not scheduler.running:
+        scheduler.start()
+        logger.info("Scheduler started")
+    
+    # Первоначальная проверка
+    try:
+        check_video_task()
+    except Exception as e:
+        logger.error(f"Initial check failed: {str(e)}")
+    
     return app
 
 if __name__ == "__main__":
