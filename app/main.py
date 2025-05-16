@@ -5,7 +5,7 @@ import signal
 import logging
 import threading
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from flask import Flask
 from apscheduler.schedulers.background import BackgroundScheduler
 from googleapiclient.discovery import build
@@ -36,11 +36,11 @@ class Config:
 class StateManager:
     def __init__(self):
         self._state = self._load_state()
-        self.last_sent = None  # Временное хранение последней отправки
+        self.last_sent = None
 
     @property
     def state(self):
-        return self._state.copy()  # Возвращаем копию состояния
+        return self._state.copy()
 
     def _load_state(self):
         try:
@@ -121,7 +121,7 @@ class TelegramService:
                     'text': message,
                     'parse_mode': 'HTML'
                 },
-                timeout=25  # Увеличенный таймаут
+                timeout=25
             )
             response.raise_for_status()
             return True
@@ -132,11 +132,10 @@ class TelegramService:
         return False
 
 def check_video_task():
-    with lock:  # Полная блокировка задачи
+    with lock:
         logger.info("\n" + "="*40)
         logger.info("Начало проверки видео")
 
-        # Получение данных
         response = YouTubeService.get_latest_video()
         if not response or not response.get('items'):
             return
@@ -145,20 +144,24 @@ def check_video_task():
             video = response['items'][0]
             current_id = video['id']['videoId']
             title = video['snippet']['title']
+            
+            # Парсинг времени с учетом временной зоны
             published_at = datetime.fromisoformat(
-                video['snippet']['publishedAt'].replace('Z', '+00:00')
-            )
+                video['snippet']['publishedAt'].replace('Z', '')
+            ).replace(tzinfo=timezone.utc)
+            
         except KeyError as e:
             logger.error(f"Invalid YouTube response: {e}")
             return
 
-        # Проверка возраста видео
-        time_diff = datetime.utcnow() - published_at
+        # Расчет времени с учетом временной зоны
+        current_time = datetime.now(timezone.utc)
+        time_diff = current_time - published_at
+        
         if time_diff > timedelta(minutes=Config.CHECK_INTERVAL * 2):
             logger.warning(f"Пропуск старого видео ({time_diff} old)")
             return
 
-        # Работа с состоянием
         current_state = state_manager.state
         
         if not current_state['initialized']:
@@ -169,7 +172,6 @@ def check_video_task():
             })
             return
 
-        # Проверка изменений
         if current_id != current_state['last_video_id'] and current_id != state_manager.last_sent:
             logger.info(f"Обнаружено новое видео: {current_id}")
             if TelegramService.send_alert({'id': current_id, 'title': title}):
