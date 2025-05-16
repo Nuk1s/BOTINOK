@@ -33,7 +33,7 @@ class Config:
     STATE_FILE = "bot_state.json"
     CHECK_INTERVAL = 10  # Интервал проверки в минутах
     MAX_VIDEO_AGE_HOURS = 24  # Макс. возраст видео для инициализации
-    PORT = int(os.getenv("PORT", 8000))  # Порт из переменной окружения
+    PORT = int(os.getenv("PORT", 10000))  # Фиксированный порт для Render
 
 class StateManager:
     def __init__(self):
@@ -47,11 +47,8 @@ class StateManager:
     def _load_state(self):
         try:
             with open(Config.STATE_FILE, 'r') as f:
-                data = json.load(f)
-                logger.info(f"Состояние загружено: {json.dumps(data, indent=2)}")
-                return data
+                return json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
-            logger.warning("Инициализация нового состояния")
             return self._create_default_state()
         except Exception as e:
             logger.error(f"Ошибка загрузки: {str(e)}")
@@ -68,7 +65,6 @@ class StateManager:
                     json.dump(self._state, f, indent=2)
                     f.flush()
                     os.fsync(f.fileno())
-                logger.debug(f"Сохранённое состояние: {json.dumps(self._state, indent=2)}")
             except Exception as e:
                 logger.error(f"Ошибка сохранения: {str(e)}")
 
@@ -76,11 +72,7 @@ state_manager = StateManager()
 
 @app.route('/')
 def health_check():
-    return {
-        "status": "running",
-        "last_video": state_manager.state['last_video_id'],
-        "initialized": state_manager.state['initialized']
-    }, 200
+    return {"status": "running"}, 200
 
 class YouTubeService:
     @staticmethod
@@ -94,21 +86,15 @@ class YouTubeService:
                 order="date",
                 type="video"
             )
-            response = request.execute()
-            logger.debug(f"Ответ YouTube API: {json.dumps(response, indent=2)}")
-            return response
-        except HttpError as e:
-            logger.error(f"Ошибка YouTube API: {e}")
-            return None
+            return request.execute()
         except Exception as e:
-            logger.error(f"Ошибка YouTubeService: {e}")
+            logger.error(f"Ошибка YouTube API: {str(e)}")
             return None
 
 class TelegramService:
     @staticmethod
     def send_alert(video_data):
         if not all([Config.TG_TOKEN, Config.TG_CHANNEL]):
-            logger.error("Отсутствуют настройки Telegram!")
             return False
 
         message = (
@@ -120,68 +106,45 @@ class TelegramService:
         try:
             response = requests.post(
                 f"https://api.telegram.org/bot{Config.TG_TOKEN}/sendMessage",
-                json={
-                    'chat_id': Config.TG_CHANNEL,
-                    'text': message,
-                    'parse_mode': 'HTML'
-                },
+                json={'chat_id': Config.TG_CHANNEL, 'text': message, 'parse_mode': 'HTML'},
                 timeout=25
             )
             response.raise_for_status()
             return True
-        except requests.exceptions.HTTPError as e:
-            logger.error(f"Ошибка HTTP: {e.response.text}")
         except Exception as e:
-            logger.error(f"Ошибка отправки: {str(e)}")
-        return False
+            logger.error(f"Ошибка Telegram: {str(e)}")
+            return False
 
 def check_video_task():
     with lock:
-        logger.info("\n" + "="*40)
-        logger.info("Начало проверки видео")
-
-        response = YouTubeService.get_latest_video()
-        if not response or not response.get('items'):
-            logger.warning("Видео не найдены в ответе")
-            return
-
         try:
+            response = YouTubeService.get_latest_video()
+            if not response or not response.get('items'):
+                return
+
             video = response['items'][0]
             current_id = video['id']['videoId']
             title = video['snippet']['title']
-            published_str = video['snippet']['publishedAt'].replace('Z', '')
-            published_at = datetime.fromisoformat(published_str).replace(tzinfo=timezone.utc)
-        except KeyError as e:
-            logger.error(f"Некорректный ответ YouTube: {e}")
-            return
+            published_at = datetime.fromisoformat(
+                video['snippet']['publishedAt'].replace('Z', '')
+            ).replace(tzinfo=timezone.utc)
 
-        current_time = datetime.now(timezone.utc)
-        time_diff = current_time - published_at
-        
-        if time_diff > timedelta(hours=Config.MAX_VIDEO_AGE_HOURS):
-            logger.warning(f"Пропуск старого видео ({time_diff})")
-            return
+            if (datetime.now(timezone.utc) - published_at) > timedelta(hours=Config.MAX_VIDEO_AGE_HOURS):
+                return
 
-        current_state = state_manager.state
-        
-        if not current_state['initialized']:
-            logger.info("Инициализация состояния")
-            state_manager.update_and_save({
-                'last_video_id': current_id,
-                'initialized': True
-            })
-            return
+            current_state = state_manager.state
+            
+            if not current_state['initialized']:
+                state_manager.update_and_save({'last_video_id': current_id, 'initialized': True})
+                return
 
-        if current_id != current_state['last_video_id'] and current_id != state_manager.last_sent:
-            logger.info(f"Обнаружено новое видео: {current_id}")
-            if TelegramService.send_alert({'id': current_id, 'title': title}):
-                state_manager.last_sent = current_id
-                state_manager.update_and_save({'last_video_id': current_id})
-                logger.info("Состояние обновлено")
-            else:
-                logger.error("Ошибка отправки уведомления")
-        else:
-            logger.info("Новых видео нет")
+            if current_id != current_state['last_video_id'] and current_id != state_manager.last_sent:
+                if TelegramService.send_alert({'id': current_id, 'title': title}):
+                    state_manager.last_sent = current_id
+                    state_manager.update_and_save({'last_video_id': current_id})
+
+        except Exception as e:
+            logger.error(f"Ошибка в задаче: {str(e)}")
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(
@@ -194,10 +157,8 @@ scheduler.add_job(
 )
 
 def graceful_shutdown(signum, frame):
-    logger.info("\nЗавершение работы...")
-    scheduler.shutdown(wait=False)
+    scheduler.shutdown()
     state_manager.update_and_save(state_manager.state)
-    logger.info("Сервис остановлен")
 
 def create_app():
     signal.signal(signal.SIGTERM, graceful_shutdown)
@@ -205,13 +166,8 @@ def create_app():
     
     if not scheduler.running:
         scheduler.start()
-        logger.info("Планировщик запущен")
     
-    try:
-        check_video_task()
-    except Exception as e:
-        logger.error(f"Ошибка стартовой проверки: {e}")
-    
+    check_video_task()  # Первая проверка при старте
     return app
 
 if __name__ == "__main__":
