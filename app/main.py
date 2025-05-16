@@ -29,7 +29,7 @@ class Config:
     STATE_FILE = "bot_state.json"
     CHECK_INTERVAL = 10  # минут
     MAX_VIDEO_AGE = timedelta(hours=24)
-    PORT = int(os.getenv("PORT", 5000))  # Важно для Render
+    PORT = int(os.getenv("PORT", 5000))  # Критически важно для Render
 
 class StateManager:
     def __init__(self):
@@ -41,6 +41,9 @@ class StateManager:
                 return json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             return {'last_video_id': None, 'initialized': False}
+        except Exception as e:
+            logger.error(f"Ошибка загрузки состояния: {str(e)}")
+            return {'last_video_id': None, 'initialized': False}
     
     def update(self, new_state):
         with app_lock:
@@ -49,7 +52,7 @@ class StateManager:
                 with open(Config.STATE_FILE, 'w') as f:
                     json.dump(self._state, f, indent=2)
             except Exception as e:
-                logger.error(f"State save error: {str(e)}")
+                logger.error(f"Ошибка сохранения состояния: {str(e)}")
     
     @property
     def state(self):
@@ -59,9 +62,9 @@ state_manager = StateManager()
 
 @app.route('/')
 def health_check():
-    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}, 200
+    return {"status": "running", "port": Config.PORT}, 200
 
-def youtube_fetch():
+def fetch_youtube_video():
     try:
         youtube = build('youtube', 'v3', developerKey=Config.YT_KEY)
         req = youtube.search().list(
@@ -73,77 +76,100 @@ def youtube_fetch():
         )
         return req.execute()
     except Exception as e:
-        logger.error(f"YouTube API Error: {e}")
+        logger.error(f"Ошибка YouTube API: {str(e)}")
         return None
 
-def telegram_send(video_data):
+def send_telegram_alert(video_data):
     if not all([Config.TG_TOKEN, Config.TG_CHANNEL]):
+        logger.warning("Отсутствуют учетные данные Telegram")
         return False
     
-    message = f"🎥 New Video!\n<b>{video_data['title']}</b>\nhttps://youtu.be/{video_data['id']}"
+    message = (
+        f"🎥 Новое видео!\n\n"
+        f"<b>{video_data['title']}</b>\n\n"
+        f"Ссылка: https://youtu.be/{video_data['id']}"
+    )
     
     try:
         response = requests.post(
             f"https://api.telegram.org/bot{Config.TG_TOKEN}/sendMessage",
-            json={'chat_id': Config.TG_CHANNEL, 'text': message, 'parse_mode': 'HTML'},
-            timeout=10
+            json={
+                'chat_id': Config.TG_CHANNEL,
+                'text': message,
+                'parse_mode': 'HTML'
+            },
+            timeout=15
         )
         return response.status_code == 200
     except Exception as e:
-        logger.error(f"Telegram Error: {str(e)}")
+        logger.error(f"Ошибка Telegram: {str(e)}")
         return False
 
-def check_task():
+def video_check_task():
     with app_lock:
         try:
-            data = youtube_fetch()
+            data = fetch_youtube_video()
             if not data or not data.get('items'):
                 return
 
             video = data['items'][0]
             video_id = video['id']['videoId']
-            published = datetime.fromisoformat(
+            title = video['snippet']['title']
+            published_at = datetime.fromisoformat(
                 video['snippet']['publishedAt'].replace('Z', '') + '+00:00'
             )
 
-            if (datetime.now(timezone.utc) - published) > Config.MAX_VIDEO_AGE:
+            # Проверка возраста видео
+            if (datetime.now(timezone.utc) - published_at) > Config.MAX_VIDEO_AGE:
                 return
 
             current_state = state_manager.state
 
+            # Инициализация при первом запуске
             if not current_state['initialized']:
-                state_manager.update({'last_video_id': video_id, 'initialized': True})
+                state_manager.update({
+                    'last_video_id': video_id,
+                    'initialized': True
+                })
                 return
 
+            # Обнаружено новое видео
             if video_id != current_state['last_video_id']:
-                if telegram_send({'id': video_id, 'title': video['snippet']['title']}):
+                if send_telegram_alert({'id': video_id, 'title': title}):
                     state_manager.update({'last_video_id': video_id})
 
         except Exception as e:
-            logger.error(f"Task failed: {str(e)}")
+            logger.error(f"Ошибка в задаче проверки: {str(e)}")
 
 scheduler = BackgroundScheduler()
-scheduler.add_job(
-    check_task,
-    'interval',
-    minutes=Config.CHECK_INTERVAL,
-    max_instances=1
-)
 
 def shutdown_handler(signum, frame):
-    logger.info("Shutting down...")
+    logger.info("Завершение работы...")
     scheduler.shutdown()
-    logger.info("Scheduler stopped")
+    logger.info("Планировщик остановлен")
 
 def create_app():
-    signal.signal(signal.SIGTERM, shutdown_handler)
-    signal.signal(signal.SIGINT, shutdown_handler)
-    
-    if not scheduler.running:
-        scheduler.start()
-        logger.info("Scheduler started")
-        check_task()
-    
+    # Запускаем только в основном процессе Gunicorn
+    if not os.environ.get("GUNICORN_WORKER"):
+        signal.signal(signal.SIGTERM, shutdown_handler)
+        signal.signal(signal.SIGINT, shutdown_handler)
+        
+        scheduler.add_job(
+            video_check_task,
+            'interval',
+            minutes=Config.CHECK_INTERVAL,
+            max_instances=1,
+            coalesce=True
+        )
+        
+        try:
+            if not scheduler.running:
+                scheduler.start()
+                logger.info(f"Планировщик запущен на порту {Config.PORT}")
+                video_check_task()  # Первоначальная проверка
+        except Exception as e:
+            logger.error(f"Ошибка запуска планировщика: {str(e)}")
+
     return app
 
 if __name__ == "__main__":
