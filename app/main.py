@@ -11,7 +11,6 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-# Настройка логирования
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -46,13 +45,13 @@ class StateManager:
         try:
             with open(Config.STATE_FILE, 'r') as f:
                 data = json.load(f)
-                logger.info(f"Загружено состояние: {json.dumps(data, indent=2)}")
+                logger.info(f"Loaded state: {json.dumps(data, indent=2)}")
                 return data
         except (FileNotFoundError, json.JSONDecodeError):
-            logger.warning("Инициализация нового состояния")
+            logger.warning("Initializing new state")
             return self._create_default_state()
         except Exception as e:
-            logger.error(f"Ошибка загрузки: {str(e)}")
+            logger.error(f"Load error: {str(e)}")
             return self._create_default_state()
 
     def _create_default_state(self):
@@ -64,9 +63,11 @@ class StateManager:
             try:
                 with open(Config.STATE_FILE, 'w') as f:
                     json.dump(self._state, f, indent=2)
-                logger.debug(f"Сохранено состояние: {json.dumps(self._state, indent=2)}")
+                    f.flush()
+                    os.fsync(f.fileno())
+                logger.debug(f"Saved state: {json.dumps(self._state, indent=2)}")
             except Exception as e:
-                logger.error(f"Ошибка сохранения: {str(e)}")
+                logger.error(f"Save error: {str(e)}")
 
 state_manager = StateManager()
 
@@ -104,7 +105,7 @@ class TelegramService:
     @staticmethod
     def send_alert(video_data):
         if not all([Config.TG_TOKEN, Config.TG_CHANNEL]):
-            logger.error("Telegram credentials missing!")
+            logger.error("Missing Telegram credentials!")
             return False
 
         message = (
@@ -134,7 +135,7 @@ class TelegramService:
 def check_video_task():
     with lock:
         logger.info("\n" + "="*40)
-        logger.info("Начало проверки видео")
+        logger.info("Starting video check")
 
         response = YouTubeService.get_latest_video()
         if not response or not response.get('items'):
@@ -144,44 +145,44 @@ def check_video_task():
             video = response['items'][0]
             current_id = video['id']['videoId']
             title = video['snippet']['title']
-            
-            # Парсинг времени с учетом временной зоны
-            published_at = datetime.fromisoformat(
-                video['snippet']['publishedAt'].replace('Z', '')
-            ).replace(tzinfo=timezone.utc)
-            
+            published_str = video['snippet']['publishedAt'].replace('Z', '')
+            published_at = datetime.fromisoformat(published_str).replace(tzinfo=timezone.utc)
         except KeyError as e:
             logger.error(f"Invalid YouTube response: {e}")
             return
 
-        # Расчет времени с учетом временной зоны
         current_time = datetime.now(timezone.utc)
         time_diff = current_time - published_at
         
-        if time_diff > timedelta(minutes=Config.CHECK_INTERVAL * 2):
-            logger.warning(f"Пропуск старого видео ({time_diff} old)")
+        # Проверка возраста видео (максимум 2 интервала проверки)
+        max_age = timedelta(minutes=Config.CHECK_INTERVAL * 2)
+        if time_diff > max_age:
+            logger.warning(f"Skipping old video ({time_diff} old)")
             return
 
         current_state = state_manager.state
         
+        # Инициализация состояния при первом запуске
         if not current_state['initialized']:
-            logger.info("Инициализация состояния")
+            logger.info("Initializing state")
             state_manager.update_and_save({
                 'last_video_id': current_id,
                 'initialized': True
             })
+            current_state = state_manager.state  # Обновляем локальное состояние
             return
 
+        # Основная логика проверки
         if current_id != current_state['last_video_id'] and current_id != state_manager.last_sent:
-            logger.info(f"Обнаружено новое видео: {current_id}")
+            logger.info(f"New video detected: {current_id}")
             if TelegramService.send_alert({'id': current_id, 'title': title}):
                 state_manager.last_sent = current_id
                 state_manager.update_and_save({'last_video_id': current_id})
-                logger.info("Состояние успешно обновлено")
+                logger.info("State updated successfully")
             else:
-                logger.error("Ошибка отправки уведомления")
+                logger.error("Notification failed")
         else:
-            logger.info("Нет новых видео")
+            logger.info("No new videos")
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(
@@ -194,10 +195,10 @@ scheduler.add_job(
 )
 
 def graceful_shutdown(signum, frame):
-    logger.info("\nЗавершение работы...")
+    logger.info("\nShutting down...")
     scheduler.shutdown(wait=False)
     state_manager.update_and_save(state_manager.state)
-    logger.info("Сервис остановлен")
+    logger.info("Service stopped")
 
 def create_app():
     signal.signal(signal.SIGTERM, graceful_shutdown)
@@ -205,12 +206,12 @@ def create_app():
     
     if not scheduler.running:
         scheduler.start()
-        logger.info("Планировщик запущен")
+        logger.info("Scheduler started")
     
     try:
         check_video_task()
     except Exception as e:
-        logger.error(f"Стартовая проверка не удалась: {e}")
+        logger.error(f"Initial check failed: {e}")
     
     return app
 
