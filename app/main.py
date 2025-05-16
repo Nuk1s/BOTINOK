@@ -25,9 +25,16 @@ class Config:
     TG_CHANNEL = os.getenv("TG_CHANNEL")
     YT_KEY = os.getenv("YT_KEY")
     YT_CHANNEL_ID = os.getenv("YT_CHANNEL_ID")
-    STATE_FILE = os.path.join(os.path.abspath(os.path.dirname(__file__)), "bot_state.json")
+    STATE_FILE = os.path.join(os.path.dirname(__file__), "bot_state.json")
     CHECK_INTERVAL = 10
-    PORT = int(os.environ["PORT"])  # Только из переменной окружения
+    PORT = int(os.environ["PORT"])  # Обязательное использование переменной окружения
+
+    @classmethod
+    def verify_config(cls):
+        required = ["TG_TOKEN", "TG_CHANNEL", "YT_KEY", "YT_CHANNEL_ID"]
+        missing = [var for var in required if not getattr(cls, var)]
+        if missing:
+            raise ValueError(f"Отсутствуют переменные окружения: {', '.join(missing)}")
 
 class StateManager:
     def __init__(self):
@@ -50,6 +57,7 @@ state_manager = StateManager()
 
 @app.route('/')
 def health_check():
+    logger.info(f"Health check на порту {Config.PORT}")
     return {"status": "OK", "port": Config.PORT}, 200
 
 def youtube_fetch():
@@ -70,7 +78,7 @@ def telegram_send(video_data):
             'text': f"🎥 Новое видео!\n<b>{video_data['title']}</b>\nhttps://youtu.be/{video_data['id']}",
             'parse_mode': 'HTML'
         },
-        timeout=10
+        timeout=15
     )
     return response.ok
 
@@ -87,13 +95,15 @@ def check_task():
 
             if not state_manager._state['initialized']:
                 state_manager.update({'last_video_id': video_id, 'initialized': True})
+                logger.info("Инициализировано начальное состояние")
                 return
 
             if video_id != state_manager._state['last_video_id']:
                 if telegram_send({'id': video_id, 'title': video['snippet']['title']}):
                     state_manager.update({'last_video_id': video_id})
+                    logger.info(f"Отправлено уведомление для видео {video_id}")
         except Exception as e:
-            logger.error(f"Ошибка: {str(e)}", exc_info=True)
+            logger.error(f"Ошибка в задаче: {str(e)}", exc_info=True)
 
 scheduler = BackgroundScheduler()
 
@@ -102,12 +112,22 @@ def shutdown_handler(signum, frame):
     scheduler.shutdown()
 
 def create_app():
+    Config.verify_config()  # Проверка конфигурации
+    
     if os.environ.get("GUNICORN_WORKER") != "true":
         signal.signal(signal.SIGTERM, shutdown_handler)
         signal.signal(signal.SIGINT, shutdown_handler)
-        scheduler.add_job(check_task, 'interval', minutes=Config.CHECK_INTERVAL)
+        
+        scheduler.add_job(
+            check_task,
+            'interval',
+            minutes=Config.CHECK_INTERVAL,
+            misfire_grace_time=300
+        )
         scheduler.start()
         check_task()
+        logger.info(f"Сервер запущен на порту {Config.PORT}")
+    
     return app
 
 if __name__ == "__main__":
