@@ -3,7 +3,7 @@ services:
     name: youtube-monitor
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app.main:app --bind 0.0.0.0:$PORT
+    startCommand: gunicorn app.main:app --bind 0.0.0.0:$PORT --workers 1
     envVars:
       - key: PORT
         value: 10000
