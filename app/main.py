@@ -9,21 +9,17 @@ from datetime import datetime, timedelta, timezone
 from flask import Flask
 from apscheduler.schedulers.background import BackgroundScheduler
 from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
 
-# Настройка логирования
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('bot.log')
-    ]
-)
+# Инициализация логгера
 logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
 
 app = Flask(__name__)
-lock = threading.Lock()
+app_lock = threading.Lock()
 
 class Config:
     TG_TOKEN = os.getenv("TG_TOKEN")
@@ -31,144 +27,125 @@ class Config:
     YT_KEY = os.getenv("YT_KEY")
     YT_CHANNEL_ID = os.getenv("YT_CHANNEL_ID")
     STATE_FILE = "bot_state.json"
-    CHECK_INTERVAL = 10  # Интервал проверки в минутах
-    MAX_VIDEO_AGE_HOURS = 24  # Макс. возраст видео для инициализации
-    PORT = int(os.getenv("PORT", 10000))  # Фиксированный порт для Render
+    CHECK_INTERVAL = 10  # минут
+    MAX_VIDEO_AGE = timedelta(hours=24)
+    PORT = int(os.getenv("PORT", 5000))  # Важно для Render
 
 class StateManager:
     def __init__(self):
         self._state = self._load_state()
-        self.last_sent = None
-
-    @property
-    def state(self):
-        return self._state.copy()
-
+    
     def _load_state(self):
         try:
             with open(Config.STATE_FILE, 'r') as f:
                 return json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
-            return self._create_default_state()
-        except Exception as e:
-            logger.error(f"Ошибка загрузки: {str(e)}")
-            return self._create_default_state()
-
-    def _create_default_state(self):
-        return {'last_video_id': None, 'initialized': False}
-
-    def update_and_save(self, new_state):
-        with lock:
+            return {'last_video_id': None, 'initialized': False}
+    
+    def update(self, new_state):
+        with app_lock:
             self._state.update(new_state)
             try:
                 with open(Config.STATE_FILE, 'w') as f:
                     json.dump(self._state, f, indent=2)
-                    f.flush()
-                    os.fsync(f.fileno())
             except Exception as e:
-                logger.error(f"Ошибка сохранения: {str(e)}")
+                logger.error(f"State save error: {str(e)}")
+    
+    @property
+    def state(self):
+        return self._state.copy()
 
 state_manager = StateManager()
 
 @app.route('/')
 def health_check():
-    return {"status": "running"}, 200
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}, 200
 
-class YouTubeService:
-    @staticmethod
-    def get_latest_video():
-        try:
-            youtube = build('youtube', 'v3', developerKey=Config.YT_KEY)
-            request = youtube.search().list(
-                part="snippet",
-                channelId=Config.YT_CHANNEL_ID,
-                maxResults=1,
-                order="date",
-                type="video"
-            )
-            return request.execute()
-        except Exception as e:
-            logger.error(f"Ошибка YouTube API: {str(e)}")
-            return None
-
-class TelegramService:
-    @staticmethod
-    def send_alert(video_data):
-        if not all([Config.TG_TOKEN, Config.TG_CHANNEL]):
-            return False
-
-        message = (
-            f"🎥 Новое видео!\n\n"
-            f"<b>{video_data['title']}</b>\n\n"
-            f"Ссылка: https://youtu.be/{video_data['id']}"
+def youtube_fetch():
+    try:
+        youtube = build('youtube', 'v3', developerKey=Config.YT_KEY)
+        req = youtube.search().list(
+            part="snippet",
+            channelId=Config.YT_CHANNEL_ID,
+            maxResults=1,
+            order="date",
+            type="video"
         )
-        
-        try:
-            response = requests.post(
-                f"https://api.telegram.org/bot{Config.TG_TOKEN}/sendMessage",
-                json={'chat_id': Config.TG_CHANNEL, 'text': message, 'parse_mode': 'HTML'},
-                timeout=25
-            )
-            response.raise_for_status()
-            return True
-        except Exception as e:
-            logger.error(f"Ошибка Telegram: {str(e)}")
-            return False
+        return req.execute()
+    except Exception as e:
+        logger.error(f"YouTube API Error: {e}")
+        return None
 
-def check_video_task():
-    with lock:
+def telegram_send(video_data):
+    if not all([Config.TG_TOKEN, Config.TG_CHANNEL]):
+        return False
+    
+    message = f"🎥 New Video!\n<b>{video_data['title']}</b>\nhttps://youtu.be/{video_data['id']}"
+    
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{Config.TG_TOKEN}/sendMessage",
+            json={'chat_id': Config.TG_CHANNEL, 'text': message, 'parse_mode': 'HTML'},
+            timeout=10
+        )
+        return response.status_code == 200
+    except Exception as e:
+        logger.error(f"Telegram Error: {str(e)}")
+        return False
+
+def check_task():
+    with app_lock:
         try:
-            response = YouTubeService.get_latest_video()
-            if not response or not response.get('items'):
+            data = youtube_fetch()
+            if not data or not data.get('items'):
                 return
 
-            video = response['items'][0]
-            current_id = video['id']['videoId']
-            title = video['snippet']['title']
-            published_at = datetime.fromisoformat(
-                video['snippet']['publishedAt'].replace('Z', '')
-            ).replace(tzinfo=timezone.utc)
+            video = data['items'][0]
+            video_id = video['id']['videoId']
+            published = datetime.fromisoformat(
+                video['snippet']['publishedAt'].replace('Z', '') + '+00:00'
+            )
 
-            if (datetime.now(timezone.utc) - published_at) > timedelta(hours=Config.MAX_VIDEO_AGE_HOURS):
+            if (datetime.now(timezone.utc) - published) > Config.MAX_VIDEO_AGE:
                 return
 
             current_state = state_manager.state
-            
+
             if not current_state['initialized']:
-                state_manager.update_and_save({'last_video_id': current_id, 'initialized': True})
+                state_manager.update({'last_video_id': video_id, 'initialized': True})
                 return
 
-            if current_id != current_state['last_video_id'] and current_id != state_manager.last_sent:
-                if TelegramService.send_alert({'id': current_id, 'title': title}):
-                    state_manager.last_sent = current_id
-                    state_manager.update_and_save({'last_video_id': current_id})
+            if video_id != current_state['last_video_id']:
+                if telegram_send({'id': video_id, 'title': video['snippet']['title']}):
+                    state_manager.update({'last_video_id': video_id})
 
         except Exception as e:
-            logger.error(f"Ошибка в задаче: {str(e)}")
+            logger.error(f"Task failed: {str(e)}")
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(
-    check_video_task,
+    check_task,
     'interval',
     minutes=Config.CHECK_INTERVAL,
-    max_instances=1,
-    coalesce=True,
-    misfire_grace_time=300
+    max_instances=1
 )
 
-def graceful_shutdown(signum, frame):
+def shutdown_handler(signum, frame):
+    logger.info("Shutting down...")
     scheduler.shutdown()
-    state_manager.update_and_save(state_manager.state)
+    logger.info("Scheduler stopped")
 
 def create_app():
-    signal.signal(signal.SIGTERM, graceful_shutdown)
-    signal.signal(signal.SIGINT, graceful_shutdown)
+    signal.signal(signal.SIGTERM, shutdown_handler)
+    signal.signal(signal.SIGINT, shutdown_handler)
     
     if not scheduler.running:
         scheduler.start()
+        logger.info("Scheduler started")
+        check_task()
     
-    check_video_task()  # Первая проверка при старте
     return app
 
 if __name__ == "__main__":
-    create_app().run(host='0.0.0.0', port=Config.PORT)
+    app = create_app()
+    app.run(host='0.0.0.0', port=Config.PORT)
