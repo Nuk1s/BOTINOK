@@ -12,7 +12,7 @@ from googleapiclient.errors import HttpError
 
 # Настройка логирования
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # Уровень DEBUG для детальных логов
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),
@@ -40,33 +40,57 @@ class StateManager:
         try:
             with open(Config.STATE_FILE, 'r') as f:
                 data = json.load(f)
-                logger.info(f"Loaded state: {data}")
+                logger.info(f"Состояние загружено: {data}")
                 return data
         except FileNotFoundError:
-            logger.warning("State file not found. Creating new one.")
-            self._create_default_state()
-            return {'last_video_id': None, 'initialized': False}
+            logger.warning("Файл состояния не найден. Создание нового.")
+            return self._create_default_state()
+        except json.JSONDecodeError:
+            logger.error("Ошибка чтения файла состояния. Пересоздаю.")
+            return self._create_default_state()
         except Exception as e:
-            logger.error(f"State load error: {str(e)}")
+            logger.error(f"Ошибка загрузки состояния: {str(e)}")
             return {'last_video_id': None, 'initialized': False}
 
     def _create_default_state(self):
+        default_state = {'last_video_id': None, 'initialized': False}
         with open(Config.STATE_FILE, 'w') as f:
-            json.dump({'last_video_id': None, 'initialized': False}, f)
+            json.dump(default_state, f)
+        return default_state
 
     def save_state(self):
         try:
             with open(Config.STATE_FILE, 'w') as f:
                 json.dump(self.state, f)
-            logger.info("State saved successfully")
+            logger.info("Состояние успешно сохранено")
         except Exception as e:
-            logger.error(f"State save failed: {str(e)}")
+            logger.error(f"Ошибка сохранения состояния: {str(e)}")
 
 state_manager = StateManager()
 
 @app.route('/')
 def health_check():
-    return {"status": "running"}, 200
+    return {"status": "running", "last_checked": state_manager.state.get('last_video_id')}, 200
+
+@app.route('/test_telegram')
+def test_telegram():
+    """Ручная проверка отправки сообщения в Telegram"""
+    test_message = "🚀 Тестовое сообщение от бота!"
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{Config.TG_TOKEN}/sendMessage",
+            json={
+                'chat_id': Config.TG_CHANNEL,
+                'text': test_message,
+                'parse_mode': 'HTML'
+            },
+            timeout=10
+        )
+        response.raise_for_status()
+        return {"status": "success", "message": "Тест отправлен!"}, 200
+    except Exception as e:
+        logger.error(f"Тест Telegram провален: {str(e)}")
+        return {"status": "error", "message": str(e)}, 500
 
 class YouTubeService:
     @staticmethod
@@ -81,22 +105,22 @@ class YouTubeService:
                 type="video"
             )
             response = request.execute()
-            logger.debug("YouTube API response: %s", response)
+            logger.debug(f"Ответ YouTube API: {json.dumps(response, indent=2)}")
             return response
         except HttpError as e:
-            logger.error(f"YouTube API Error: {e}")
+            logger.error(f"Ошибка YouTube API: {e}")
             return None
         except Exception as e:
-            logger.error(f"YouTube Service Error: {e}")
+            logger.error(f"Общая ошибка YouTubeService: {e}")
             return None
 
 class TelegramService:
     @staticmethod
     def send_alert(video_data):
         if not all([Config.TG_TOKEN, Config.TG_CHANNEL]):
-            logger.error("Telegram credentials not configured!")
+            logger.error("Отсутствуют настройки Telegram!")
             return False
-            
+
         message = (
             f"🎥 Новое видео!\n\n"
             f"<b>{video_data['title']}</b>\n\n"
@@ -114,64 +138,62 @@ class TelegramService:
                 timeout=15
             )
             response.raise_for_status()
-            logger.info("Message sent to Telegram successfully")
+            logger.info("Сообщение успешно отправлено в Telegram")
             return True
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Telegram API Error: {str(e)}")
-            if response:
-                logger.error(f"Response content: {response.text}")
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"Ошибка HTTP: {e.response.text}")
             return False
         except Exception as e:
-            logger.error(f"Telegram Service Error: {str(e)}")
+            logger.error(f"Ошибка отправки в Telegram: {str(e)}")
             return False
 
 def check_video_task():
     with lock:
-        logger.info("===== Starting video check =====")
+        logger.info("\n" + "="*40)
+        logger.info("Начало проверки видео")
         
-        # Получаем данные с YouTube
+        # Получаем данные YouTube
         response = YouTubeService.get_latest_video()
         if not response:
-            logger.error("Failed to get YouTube data")
+            logger.error("Не удалось получить данные с YouTube")
             return
 
-        items = response.get('items')
+        items = response.get('items', [])
         if not items:
-            logger.warning("No videos found in response")
+            logger.warning("В ответе YouTube нет видео")
             return
 
         try:
             video = items[0]
             current_id = video['id']['videoId']
             title = video['snippet']['title']
-            logger.info(f"Latest video: {current_id} - {title}")
+            logger.info(f"Последнее видео: {current_id} - {title}")
         except KeyError as e:
-            logger.error(f"Invalid YouTube response structure: {str(e)}")
+            logger.error(f"Некорректная структура ответа YouTube: {e}")
             return
 
         # Обработка состояния
         state = state_manager.state
-        logger.debug(f"Current state: {state}")
+        logger.debug(f"Текущее состояние: {state}")
 
         if not state['initialized']:
-            logger.info("Initializing state with first video")
-            state['last_video_id'] = current_id
-            state['initialized'] = True
+            logger.info("Инициализация состояния первым видео")
+            state.update(last_video_id=current_id, initialized=True)
             state_manager.save_state()
             return
 
         if current_id != state['last_video_id']:
-            logger.info("New video detected! Sending notification...")
+            logger.info("Обнаружено новое видео! Отправка уведомления...")
             video_data = {'id': current_id, 'title': title}
             
             if TelegramService.send_alert(video_data):
                 state['last_video_id'] = current_id
                 state_manager.save_state()
-                logger.info("State updated successfully")
+                logger.info("Состояние обновлено")
             else:
-                logger.error("Failed to send notification")
+                logger.error("Не удалось отправить уведомление")
         else:
-            logger.info("No new videos found")
+            logger.info("Новых видео не найдено")
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(
@@ -184,27 +206,23 @@ scheduler.add_job(
 )
 
 def graceful_shutdown(signum, frame):
-    logger.info("Shutting down scheduler...")
+    logger.info("\nЗавершение работы...")
     scheduler.shutdown()
-    logger.info("Saving final state...")
     state_manager.save_state()
-    logger.info("Shutdown complete")
+    logger.info("Сервис остановлен")
 
 def create_app():
-    # Регистрация обработчиков сигналов
     signal.signal(signal.SIGTERM, graceful_shutdown)
     signal.signal(signal.SIGINT, graceful_shutdown)
     
-    # Запуск планировщика
     if not scheduler.running:
         scheduler.start()
-        logger.info("Scheduler started")
+        logger.info("Планировщик задач запущен")
     
-    # Первоначальная проверка
     try:
         check_video_task()
     except Exception as e:
-        logger.error(f"Initial check failed: {str(e)}")
+        logger.error(f"Ошибка при стартовой проверке: {e}")
     
     return app
 
