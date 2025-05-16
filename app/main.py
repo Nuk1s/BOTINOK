@@ -28,7 +28,7 @@ class Config:
     STATE_FILE = "bot_state.json"
     CHECK_INTERVAL = 10
     MAX_VIDEO_AGE = timedelta(hours=24)
-    PORT = int(os.getenv("PORT", 5000))  # Исправлено значение по умолчанию
+    PORT = int(os.getenv("PORT", 5000))
 
 class StateManager:
     def __init__(self):
@@ -40,6 +40,9 @@ class StateManager:
                 return json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             return {'last_video_id': None, 'initialized': False}
+        except Exception as e:
+            logger.error(f"Ошибка загрузки состояния: {str(e)}")
+            return {'last_video_id': None, 'initialized': False}
     
     def update(self, new_state):
         with app_lock:
@@ -49,6 +52,10 @@ class StateManager:
                     json.dump(self._state, f, indent=2)
             except Exception as e:
                 logger.error(f"Ошибка сохранения: {str(e)}")
+    
+    @property  # Добавлен декоратор свойства
+    def state(self):
+        return self._state.copy()
 
 state_manager = StateManager()
 
@@ -108,7 +115,7 @@ def check_task():
             if (datetime.now(timezone.utc) - published) > Config.MAX_VIDEO_AGE:
                 return
 
-            current_state = state_manager.state
+            current_state = state_manager.state  # Теперь доступ через свойство
 
             if not current_state['initialized']:
                 state_manager.update({'last_video_id': video_id, 'initialized': True})
